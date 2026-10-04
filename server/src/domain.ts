@@ -1,15 +1,20 @@
+// 危险品隔离校验延迟接入（hazmat.ts 反向引用本模块的内存数据，避免循环初始化）
+import { applyEvaluationToTask, evaluatePlan, evaluateTask } from './hazmat.js';
+
 export type ContainerStatus = 'in-transit' | 'at-gate' | 'in-yard' | 'on-quay' | 'released' | 'hold';
 export type EquipmentKind = 'quay-crane' | 'yard-crane' | 'terminal-truck' | 'reach-stacker';
 export type TaskStatus = 'queued' | 'assigned' | 'executing' | 'blocked' | 'done';
 export type AppointmentStatus = 'booked' | 'checked-in' | 'completed' | 'cancelled' | 'exception';
 
 export interface Voyage { id: string; vessel: string; imo: string; service: string; eta: string; etd: string; status: 'approaching' | 'berthed' | 'loading' | 'departed'; berth: string; movesPlanned: number; movesDone: number; lateRisk: 'low' | 'medium' | 'high'; }
-export interface Container { id: string; voyageId: string; size: '20' | '40' | '45'; isoType: string; direction: 'import' | 'export' | 'transshipment'; status: ContainerStatus; weightT: number; reefer: boolean; temperature?: number; hazmatClass?: string; customs: 'released' | 'inspection' | 'hold'; priority: 'normal' | 'hot' | 'reefer' | 'hazmat'; yardSlot: string; appointmentId?: string; lastEvent: string; }
-export interface YardBlock { id: string; zone: string; rows: number; tiers: number; capacity: number; occupied: number; reeferPlugs: number; usedPlugs: number; hazmatAllowed: boolean; equipment: EquipmentKind[]; heat: number; }
+export interface Container { id: string; voyageId: string; size: '20' | '40' | '45'; isoType: string; direction: 'import' | 'export' | 'transshipment'; status: ContainerStatus; weightT: number; reefer: boolean; temperature?: number; hazmatClass?: string; customs: 'released' | 'inspection' | 'hold'; priority: 'normal' | 'hot' | 'reefer' | 'hazmat'; yardSlot: string; appointmentId?: string; lastEvent: string; transit?: TransitSnapshot; }
+export interface YardBlock { id: string; zone: string; rows: number; tiers: number; capacity: number; occupied: number; reeferPlugs: number; usedPlugs: number; hazmatAllowed: boolean; /** 危险品资质覆盖的类别；缺省时允许全部类别 */ hazmatClasses?: string[]; equipment: EquipmentKind[]; heat: number; }
 export interface GateAppointment { id: string; containerId: string; truckNo: string; driver: string; type: 'pickup' | 'dropoff'; windowStart: string; windowEnd: string; lane: 'north' | 'south' | 'rail'; status: AppointmentStatus; sealVerified: boolean; weightVerified: boolean; exception?: string; }
-export interface Equipment { id: string; name: string; kind: EquipmentKind; status: 'available' | 'working' | 'maintenance' | 'offline'; location: string; battery: number; queue: number; movesPerHour: number; }
-export interface YardTask { id: string; kind: 'receive' | 'deliver' | 'rehandle' | 'load' | 'discharge' | 'inspect'; containerId: string; from: string; to: string; equipmentId?: string; priority: number; status: TaskStatus; scheduledAt: string; blockingReasons: string[]; estimatedMinutes: number; }
+export interface Equipment { id: string; name: string; kind: EquipmentKind; status: 'available' | 'working' | 'maintenance' | 'offline'; location: string; battery: number; queue: number; movesPerHour: number; /** 危险品作业资质类别，'*' 表示全类别；缺省/空数组表示无资质 */ hazmatCertifiedClasses?: string[]; }
+export interface YardTask { id: string; kind: 'receive' | 'deliver' | 'rehandle' | 'load' | 'discharge' | 'inspect'; containerId: string; from: string; to: string; equipmentId?: string; priority: number; status: TaskStatus; scheduledAt: string; blockingReasons: string[]; estimatedMinutes: number; /** 同航次装船 move 顺序（危险品间隔规则使用） */ loadSequence?: number; /** 危险品隔离校验结果（结构化阻塞原因） */ hazmat?: import('./hazmat.js').HazmatEvaluation; }
 export interface AuditEvent { id: string; actor: string; action: string; entity: string; entityId: string; at: string; details: string; }
+/** 跨区搬运在途状态（失败时阻塞新计划，直到退回原堆位或改道恢复） */
+export interface TransitSnapshot { status: 'moving' | 'failed'; fromSlot: string; toSlot: string; taskId: string; reason?: string; failedAt?: string }
 
 const start = Date.now(); const iso = (minutes: number) => new Date(start + minutes * 60000).toISOString();
 export const voyages: Voyage[] = [
@@ -30,30 +35,49 @@ export const containers: Container[] = [
   { id: 'OOLU-7734201', voyageId: 'VOY-AX7', size: '40', isoType: '45G1', direction: 'export', status: 'at-gate', weightT: 24.1, reefer: false, customs: 'released', priority: 'normal', yardSlot: 'C03-R06-T1', appointmentId: 'APT-9001', lastEvent: '南闸口已称重' },
   { id: 'CMAU-6001722', voyageId: 'VOY-QF2', size: '40', isoType: '45G1', direction: 'import', status: 'in-transit', weightT: 23.5, reefer: false, customs: 'released', priority: 'hot', yardSlot: 'B07-R10-T1', lastEvent: '船期 ETA +35min' },
   { id: 'FCIU-9920310', voyageId: 'VOY-QF2', size: '20', isoType: '22G1', direction: 'export', status: 'in-yard', weightT: 12.2, reefer: false, customs: 'released', priority: 'normal', yardSlot: 'C03-R04-T2', lastEvent: '待装船' },
-  { id: 'TEMU-1774029', voyageId: 'VOY-AX7', size: '40', isoType: '45R1', direction: 'import', status: 'in-yard', weightT: 26.3, reefer: true, temperature: 4, customs: 'inspection', priority: 'reefer', yardSlot: 'D05-R05-T1', lastEvent: '待海关查验' }
+  { id: 'TEMU-1774029', voyageId: 'VOY-AX7', size: '40', isoType: '45R1', direction: 'import', status: 'in-yard', weightT: 26.3, reefer: true, temperature: 4, customs: 'inspection', priority: 'reefer', yardSlot: 'D05-R05-T1', lastEvent: '待海关查验' },
+  { id: 'BEAU-4471208', voyageId: 'VOY-QF2', size: '20', isoType: '22K2', direction: 'export', status: 'in-yard', weightT: 18.9, reefer: false, hazmatClass: '5.1', customs: 'released', priority: 'hazmat', yardSlot: 'B07-R09-T2', lastEvent: '已过闸待装船（氧化剂）' },
+  { id: 'SNCU-5520931', voyageId: 'VOY-AX7', size: '20', isoType: '22K1', direction: 'transshipment', status: 'in-yard', weightT: 21.0, reefer: false, hazmatClass: '8', customs: 'released', priority: 'hazmat', yardSlot: 'B07-R11-T1', lastEvent: '跨区搬运途中失败，等待恢复', transit: { status: 'failed', fromSlot: 'B07-R11-T1', toSlot: 'C03-R02-T1', taskId: 'TASK-203', reason: '集卡 TT-31 液压告警，箱停在 B/C 区之间通道', failedAt: new Date(start - 8 * 60000).toISOString() } },
+  { id: 'KMTU-3104776', voyageId: 'VOY-QF2', size: '20', isoType: '22T2', direction: 'export', status: 'at-gate', weightT: 14.6, reefer: false, hazmatClass: 'X9', customs: 'released', priority: 'hazmat', yardSlot: '南闸口待入场', appointmentId: 'APT-9005', lastEvent: '闸口申报危险品类别 X9，手册未登记' }
 ];
 export const appointments: GateAppointment[] = [
   { id: 'APT-9001', containerId: 'OOLU-7734201', truckNo: '沪A·7K229', driver: '陈海', type: 'dropoff', windowStart: iso(-14), windowEnd: iso(16), lane: 'south', status: 'checked-in', sealVerified: true, weightVerified: true },
   { id: 'APT-9002', containerId: 'MSCU-4829017', truckNo: '苏E·66218', driver: '王建国', type: 'pickup', windowStart: iso(34), windowEnd: iso(64), lane: 'north', status: 'booked', sealVerified: false, weightVerified: false },
   { id: 'APT-9003', containerId: 'EISU-1288420', truckNo: '沪B·02891', driver: '赵晨', type: 'pickup', windowStart: iso(38), windowEnd: iso(68), lane: 'north', status: 'booked', sealVerified: false, weightVerified: false },
-  { id: 'APT-9004', containerId: 'FCIU-9920310', truckNo: '沪A·7K229', driver: '陈海', type: 'pickup', windowStart: iso(4), windowEnd: iso(22), lane: 'south', status: 'booked', sealVerified: false, weightVerified: false, exception: '同一车辆相邻窗口过短' }
+  { id: 'APT-9004', containerId: 'FCIU-9920310', truckNo: '沪A·7K229', driver: '陈海', type: 'pickup', windowStart: iso(4), windowEnd: iso(22), lane: 'south', status: 'booked', sealVerified: false, weightVerified: false, exception: '同一车辆相邻窗口过短' },
+  { id: 'APT-9005', containerId: 'KMTU-3104776', truckNo: '沪D·90517', driver: '刘洋', type: 'dropoff', windowStart: iso(-6), windowEnd: iso(24), lane: 'south', status: 'checked-in', sealVerified: true, weightVerified: true, exception: '危险品类别 X9 未在隔离手册登记，相容性未知' }
 ];
 export const equipment: Equipment[] = [
-  { id: 'QC-07', name: '岸桥 QC-07', kind: 'quay-crane', status: 'working', location: 'B07 / MSC Aurora', battery: 96, queue: 4, movesPerHour: 31 },
-  { id: 'YC-12', name: '场桥 YC-12', kind: 'yard-crane', status: 'working', location: 'B07-R03', battery: 72, queue: 9, movesPerHour: 24 },
-  { id: 'YC-05', name: '场桥 YC-05', kind: 'yard-crane', status: 'available', location: 'C03-R06', battery: 88, queue: 3, movesPerHour: 27 },
-  { id: 'TT-31', name: '集卡 TT-31', kind: 'terminal-truck', status: 'working', location: '南闸口', battery: 61, queue: 2, movesPerHour: 8 },
-  { id: 'RS-02', name: '正面吊 RS-02', kind: 'reach-stacker', status: 'maintenance', location: 'D05', battery: 34, queue: 0, movesPerHour: 14 }
+  { id: 'QC-07', name: '岸桥 QC-07', kind: 'quay-crane', status: 'working', location: 'B07 / MSC Aurora', battery: 96, queue: 4, movesPerHour: 31, hazmatCertifiedClasses: ['*'] },
+  { id: 'YC-12', name: '场桥 YC-12', kind: 'yard-crane', status: 'working', location: 'B07-R03', battery: 72, queue: 9, movesPerHour: 24, hazmatCertifiedClasses: ['3', '5.1', '8'] },
+  { id: 'YC-05', name: '场桥 YC-05', kind: 'yard-crane', status: 'available', location: 'C03-R06', battery: 88, queue: 3, movesPerHour: 27, hazmatCertifiedClasses: [] },
+  { id: 'TT-31', name: '集卡 TT-31', kind: 'terminal-truck', status: 'working', location: '南闸口', battery: 61, queue: 2, movesPerHour: 8, hazmatCertifiedClasses: ['3', '8', '5.1'] },
+  { id: 'RS-02', name: '正面吊 RS-02', kind: 'reach-stacker', status: 'maintenance', location: 'D05', battery: 34, queue: 0, movesPerHour: 14, hazmatCertifiedClasses: ['3', '8'] }
 ];
 export const tasks: YardTask[] = [
   { id: 'TASK-101', kind: 'deliver', containerId: 'MSCU-4829017', from: 'A01-R07-T3', to: '南闸口', equipmentId: 'YC-12', priority: 92, status: 'assigned', scheduledAt: iso(12), blockingReasons: [], estimatedMinutes: 18 },
   { id: 'TASK-102', kind: 'rehandle', containerId: 'EISU-1288420', from: 'B07-R03-T2', to: 'D05-R05-T1', equipmentId: 'YC-12', priority: 88, status: 'queued', scheduledAt: iso(24), blockingReasons: ['查验区插件余量接近阈值'], estimatedMinutes: 26 },
   { id: 'TASK-103', kind: 'inspect', containerId: 'TGHU-9831204', from: 'D05-R02-T1', to: 'D05-R02-T1', priority: 125, status: 'blocked', scheduledAt: iso(4), blockingReasons: ['RS-02 维护中', '待海关查验窗口'], estimatedMinutes: 32 },
-  { id: 'TASK-104', kind: 'load', containerId: 'FCIU-9920310', from: 'C03-R04-T2', to: 'B07 / VOY-QF2', equipmentId: 'YC-05', priority: 75, status: 'queued', scheduledAt: iso(76), blockingReasons: [], estimatedMinutes: 21 }
+  { id: 'TASK-104', kind: 'load', containerId: 'FCIU-9920310', from: 'C03-R04-T2', to: 'B07 / VOY-QF2', equipmentId: 'YC-05', priority: 75, status: 'queued', scheduledAt: iso(76), blockingReasons: [], estimatedMinutes: 21 },
+  { id: 'TASK-201', kind: 'load', containerId: 'TGHU-9831204', from: 'D05-R02-T1', to: 'B07 / VOY-AX7', equipmentId: 'QC-07', priority: 96, status: 'queued', scheduledAt: iso(60), blockingReasons: [], estimatedMinutes: 24, loadSequence: 3 },
+  { id: 'TASK-202', kind: 'load', containerId: 'BEAU-4471208', from: 'B07-R09-T2', to: 'B07 / VOY-QF2', equipmentId: 'QC-07', priority: 90, status: 'queued', scheduledAt: iso(120), blockingReasons: [], estimatedMinutes: 22, loadSequence: 2 },
+  { id: 'TASK-203', kind: 'rehandle', containerId: 'SNCU-5520931', from: 'B07-R11-T1', to: 'C03-R02-T1', equipmentId: 'TT-31', priority: 84, status: 'blocked', scheduledAt: iso(-10), blockingReasons: ['集卡 TT-31 液压告警，搬运中断'], estimatedMinutes: 19 },
+  { id: 'TASK-204', kind: 'receive', containerId: 'KMTU-3104776', from: '南闸口', to: 'B07-R12-T1', equipmentId: 'YC-05', priority: 89, status: 'queued', scheduledAt: iso(18), blockingReasons: [], estimatedMinutes: 16 },
+  { id: 'TASK-205', kind: 'rehandle', containerId: 'TGHU-9831204', from: 'D05-R02-T1', to: 'B07-R10-T2', equipmentId: 'YC-05', priority: 60, status: 'queued', scheduledAt: iso(34), blockingReasons: [], estimatedMinutes: 28 }
 ];
 export const auditEvents: AuditEvent[] = [{ id: 'AUD-500', actor: '中控调度员', action: 'REPLAN', entity: 'voyage', entityId: 'VOY-AX7', at: new Date(start - 20 * 60000).toISOString(), details: '因 QC-07 瞬时降速，重新计算 14 个高优先级作业' }];
 
 function parseSlot(slot: string) { const match = slot.match(/^([A-Z]\d\d)-/); return match?.[1]; }
+
+function hazmatSlotCheck(container: Container, slot: string, action: import('./hazmat.js').HazmatAction) {
+  if (!container.hazmatClass) return;
+  const evaluation = evaluatePlan({ action, containerId: container.id, targetSlot: slot, targetBlockId: parseSlot(slot) });
+  if (!evaluation.executable) {
+    const detail = evaluation.blockingViolations.map(v => `${v.code}：${v.message}`).join('；');
+    throw new Error(`危险品隔离校验不通过：${detail}`);
+  }
+}
+
 export function dashboard() {
   const activeVoyages = voyages.filter(v => v.status !== 'departed');
   const yardCapacity = blocks.reduce((sum, block) => sum + block.capacity, 0); const yardOccupied = blocks.reduce((sum, block) => sum + block.occupied, 0);
@@ -86,7 +110,13 @@ export function createAppointment(input: Omit<GateAppointment, 'id' | 'status' |
   const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false }; appointments.unshift(item); container.appointmentId = item.id; return item;
 }
 export function updateAppointment(id: string, patch: Partial<Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) { const item = appointments.find(a => a.id === id); if (!item) return undefined; Object.assign(item, patch); const container = containers.find(c => c.id === item.containerId); if (item.status === 'checked-in' && container) container.status = 'at-gate'; if (item.status === 'completed' && container) container.status = item.type === 'pickup' ? 'released' : 'in-yard'; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '闸口值班员', action: 'GATE_UPDATE', entity: 'appointment', entityId: id, at: new Date().toISOString(), details: JSON.stringify(patch) }); return item; }
-export function assignTask(id: string, equipmentId: string) { const task = tasks.find(item => item.id === id); const machine = equipment.find(item => item.id === equipmentId); if (!task || !machine) return undefined; const blockingReasons = [...task.blockingReasons]; if (machine.status === 'maintenance' || machine.status === 'offline') blockingReasons.push(`${machine.name} 当前不可用`); if (task.kind === 'inspect' && machine.kind !== 'reach-stacker') blockingReasons.push('查验作业需要正面吊或专用设备'); task.equipmentId = equipmentId; task.status = blockingReasons.length ? 'blocked' : 'assigned'; task.blockingReasons = blockingReasons; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action: 'ASSIGN_TASK', entity: 'yard-task', entityId: id, at: new Date().toISOString(), details: `${equipmentId} -> ${task.containerId}` }); return task; }
+export function assignTask(id: string, equipmentId: string) { const task = tasks.find(item => item.id === id); const machine = equipment.find(item => item.id === equipmentId); if (!task || !machine) return undefined; const blockingReasons = task.blockingReasons.filter(reason => !reason.startsWith('设备 ') && !reason.includes('当前不可用') && reason !== '查验作业需要正面吊或专用设备'); if (machine.status === 'maintenance' || machine.status === 'offline') blockingReasons.push(`${machine.name} 当前不可用`); if (task.kind === 'inspect' && machine.kind !== 'reach-stacker') blockingReasons.push('查验作业需要正面吊或专用设备'); task.equipmentId = equipmentId; task.blockingReasons = blockingReasons;
+  // 指派设备后立即跑危险品隔离校验（设备资质、相邻区块、同航次顺序……）
+  const evaluation = evaluateTask(task);
+  applyEvaluationToTask(task, evaluation);
+  if (machine.status === 'maintenance' || machine.status === 'offline') task.status = 'blocked';
+  else if (evaluation.blockingViolations.length === 0 && !blockingReasons.length) task.status = 'assigned';
+  auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action: 'ASSIGN_TASK', entity: 'yard-task', entityId: id, at: new Date().toISOString(), details: `${equipmentId} -> ${task.containerId}（危险品阻塞 ${evaluation.blockingViolations.length} 项，例外豁免 ${evaluation.waivedViolations.length} 项）` }); return task; }
 export function containerDetail(id: string) { const container = containers.find(item => item.id === id); if (!container) return undefined; return { container, voyage: voyages.find(v => v.id === container.voyageId), appointment: appointments.find(a => a.id === container.appointmentId), plan: containerPlan(id), tasks: tasks.filter(t => t.containerId === id) }; }
 
 export type ContainerInput = Omit<Container, 'lastEvent' | 'appointmentId'> & { appointmentId?: string };
@@ -104,7 +134,7 @@ export function createContainer(input: ContainerInput) {
   if (!voyages.some(item => item.id === input.voyageId)) throw new Error('关联航次不存在');
   const blockId = parseSlot(input.yardSlot);
   if (blockId && !blocks.some(block => block.id === blockId)) throw new Error('堆位所属区块不存在');
-  if (input.hazmatClass && blockId && !blocks.find(block => block.id === blockId)?.hazmatAllowed) throw new Error('危险品不能进入当前堆场区块');
+  hazmatSlotCheck({ ...input, id, lastEvent: '' } as Container, input.yardSlot, 'gate-entry');
   if (input.reefer && blockId) {
     const block = blocks.find(item => item.id === blockId);
     if (block && block.reeferPlugs <= block.usedPlugs) throw new Error('当前区块没有可用冷藏插座');
@@ -122,7 +152,7 @@ export function updateContainer(id: string, patch: Partial<Omit<Container, 'id' 
   const next = { ...item, ...patch };
   const blockId = parseSlot(next.yardSlot);
   if (blockId && !blocks.some(block => block.id === blockId)) throw new Error('堆位所属区块不存在');
-  if (next.hazmatClass && blockId && !blocks.find(block => block.id === blockId)?.hazmatAllowed) throw new Error('危险品不能进入当前堆场区块');
+  hazmatSlotCheck(next, next.yardSlot, 'relocation');
   Object.assign(item, patch, { lastEvent: `台账更新 ${new Date().toLocaleString()}` });
   recordAudit('UPDATE', 'container', id, '更新集装箱台账字段');
   return item;
@@ -184,7 +214,9 @@ export function createYardTask(input: TaskInput) {
   if (input.estimatedMinutes <= 0) throw new Error('预计作业时长必须大于 0');
   const item: YardTask = { ...input, id: `TASK-${Date.now()}`, status: input.equipmentId ? 'assigned' : 'queued', blockingReasons: [], scheduledAt: input.scheduledAt };
   tasks.unshift(item);
-  recordAudit('CREATE', 'yard-task', item.id, `创建 ${input.kind} 任务，关联 ${input.containerId}`);
+  // 建计划即校验：不合格结果转成结构化阻塞原因挂在任务上，而不是拒绝建单
+  applyEvaluationToTask(item, evaluateTask(item));
+  recordAudit('CREATE', 'yard-task', item.id, `创建 ${input.kind} 任务，关联 ${input.containerId}（危险品阻塞 ${item.hazmat?.blockingViolations.length ?? 0} 项）`);
   return item;
 }
 
@@ -194,6 +226,8 @@ export function updateYardTask(id: string, patch: Partial<TaskInput & Pick<YardT
   if (patch.containerId && !containers.some(container => container.id === patch.containerId)) throw new Error('关联箱号不存在');
   if (patch.priority !== undefined && (patch.priority < 1 || patch.priority > 100)) throw new Error('优先级范围为 1–100');
   Object.assign(item, patch);
+  // 路径/设备/时间变更后重跑危险品隔离校验
+  applyEvaluationToTask(item, evaluateTask(item));
   recordAudit('UPDATE', 'yard-task', id, `更新场内作业任务：${JSON.stringify(patch)}`);
   return item;
 }
